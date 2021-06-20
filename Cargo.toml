@@ -1,0 +1,15 @@
+[package]
+name = "r8ball"
+version = "0.1.0"
+authors = ["Anthony DeDominic <adedomin@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+irc-rust = "0.3.3"
+toml = "0.5.8"
+serde = { version = "1.0.97", features = ["derive"] }
+thiserror = "1.0.25"
+mio = { version = "0.7", features = ["net","os-ext"] }
+mio-signals = "0.1.5"
