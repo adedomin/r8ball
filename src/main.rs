@@ -34,6 +34,7 @@ use mio::Events;
 use mio::Interest;
 use mio::Poll;
 use mio::Token;
+use mio_signals::Signal;
 use mio_signals::SignalSet;
 use mio_signals::Signals;
 
@@ -42,9 +43,9 @@ enum MainError {
     #[error("")]
     Cmdline(#[from] ParsedArgsError),
     #[error("")]
-    InitConfig(#[from] ConfigError),
-    #[error("Event Loop IO error.")]
-    EvIo(io::Result<()>),
+    Config(#[from] ConfigError),
+    #[error("")]
+    EvIo(#[from] io::Error),
 }
 
 const IRC_CONN: mio::Token = Token(0);
@@ -65,7 +66,7 @@ fn open_conn(conn_str: String) -> Result<TcpStream, io::Error> {
     })
 }
 
-fn event_loop(config_path: &Path, config: &mut Config) -> io::Result<()> {
+fn event_loop(config_path: &Path, config: &mut Config) -> Result<(), MainError> {
     let mut client = open_conn(config.connect_string())?;
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(128);
@@ -94,7 +95,18 @@ fn event_loop(config_path: &Path, config: &mut Config) -> io::Result<()> {
                         client.write_all(b"Hello. World\r\n")?
                     }
                 }
-                SIGNAL_TOKEN => break 'outer,
+                SIGNAL_TOKEN => loop {
+                    match signals.receive()? {
+                        Some(Signal::Interrupt) | Some(Signal::Terminate) | Some(Signal::Quit) => {
+                            break 'outer
+                        }
+                        Some(Signal::User1) | Some(Signal::User2) => {
+                            *config = Config::from_path(config_path)?;
+                            println!("{:?}", config);
+                        }
+                        None => break,
+                    }
+                },
                 _ => unreachable!(),
             }
             poll.registry()
@@ -108,7 +120,7 @@ fn main() -> Result<(), MainError> {
     let args = ParsedArgs::new()?;
     let config_path = Path::new(&args.config);
     let mut config = Config::from_path(config_path)?;
-    event_loop(config_path, &mut config).map_err(|e| MainError::EvIo(Err(e)))?;
+    event_loop(config_path, &mut config)?;
 
     Ok(())
 }

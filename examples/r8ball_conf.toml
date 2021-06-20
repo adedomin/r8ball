@@ -1,5 +1,5 @@
 [general]
-nick = "neo8ball_"
+nick = "neo8ball"
 server = "localhost"
 port = 6667
 tls = false
