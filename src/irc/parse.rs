@@ -60,13 +60,14 @@ impl<'a> Iterator for MessageParamIter<'a> {
                     }
                     i += 1;
                 } else {
-                    break params.len();
+                    self.pos = params.len();
+                    return None;
                 }
             };
 
             // if the next argument is a trailing
             // collect the rest of the string and return
-            if i < params.len() && params[i] == b':' {
+            if params[i] == b':' {
                 self.pos = params.len();
                 return Some(&params[i + 1..]);
             }
@@ -150,10 +151,7 @@ impl<'a> Message<'a> {
         let mut ret = Message::default();
         let mut arg_state = ParseState::Prefix;
 
-        // this is the byte position the iterator has not consumed.
-        let mut pos = 0usize;
         for part in raw.split(|&chr| chr == b' ') {
-            pos += part.len() + 1;
             if part.is_empty() {
                 continue;
             }
@@ -181,7 +179,9 @@ impl<'a> Message<'a> {
                     ParseState::Params
                 }
                 ParseState::Params => {
-                    ret.params = Some(&raw[pos - part.len() - 1..]);
+                    // calculate rest of buffer unconsumed.
+                    let idx = part.as_ptr() as usize - raw.as_ptr() as usize;
+                    ret.params = Some(&raw[idx..]);
                     break;
                 }
             }

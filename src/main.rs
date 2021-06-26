@@ -21,99 +21,20 @@ mod config;
 mod irc;
 
 use std::io;
-use std::io::Read;
-use std::io::Write;
-use std::net::ToSocketAddrs;
 use std::path::Path;
-use std::time::Duration;
 
 use config::cmdline::{ParsedArgs, ParsedArgsError};
 use config::config_file::{Config, ConfigError};
-use mio::net::TcpStream;
-use mio::Events;
-use mio::Interest;
-use mio::Poll;
-use mio::Token;
-use mio_signals::Signal;
-use mio_signals::SignalSet;
-use mio_signals::Signals;
+use irc::net::event_loop;
 
 #[derive(thiserror::Error, Debug)]
-enum MainError {
+pub enum MainError {
     #[error("")]
     Cmdline(#[from] ParsedArgsError),
     #[error("")]
     Config(#[from] ConfigError),
     #[error("")]
     EvIo(#[from] io::Error),
-}
-
-const IRC_CONN: mio::Token = Token(0);
-const SIGNAL_TOKEN: mio::Token = Token(1);
-
-fn open_conn(conn_str: String) -> Result<TcpStream, io::Error> {
-    let mut conn_details = conn_str.to_socket_addrs()?;
-    let mut try_e = io::Error::new(io::ErrorKind::Other, "Should Never Happen.");
-    Ok(loop {
-        if let Some(addr) = conn_details.next() {
-            match TcpStream::connect(addr) {
-                Ok(conn) => break conn,
-                Err(e) => try_e = e,
-            }
-        } else {
-            return Err(try_e);
-        }
-    })
-}
-
-fn event_loop(config_path: &Path, config: &mut Config) -> Result<(), MainError> {
-    let mut client = open_conn(config.connect_string())?;
-    let mut poll = Poll::new()?;
-    let mut events = Events::with_capacity(128);
-    let mut signals = Signals::new(SignalSet::all())?;
-
-    poll.registry()
-        .register(&mut client, IRC_CONN, Interest::WRITABLE)?;
-    poll.registry()
-        .register(&mut signals, SIGNAL_TOKEN, Interest::READABLE)?;
-
-    'outer: loop {
-        poll.poll(&mut events, Some(Duration::from_secs(1)))?;
-        for event in &events {
-            let mut interest = Interest::READABLE;
-            match event.token() {
-                IRC_CONN => {
-                    if event.is_readable() {
-                        let mut b = [0u8; 512];
-                        let s = client.read(&mut b)?;
-                        if s == 0 {
-                            break 'outer;
-                        }
-                        println!("{:?}", &b[..s]);
-                        interest |= Interest::WRITABLE;
-                    } else {
-                        client.write_all(b"Hello. World\r\n")?
-                    }
-                }
-                SIGNAL_TOKEN => loop {
-                    match signals.receive()? {
-                        Some(Signal::Interrupt) | Some(Signal::Terminate) | Some(Signal::Quit) => {
-                            break 'outer
-                        }
-                        Some(Signal::User1) | Some(Signal::User2) => {
-                            *config = Config::from_path(config_path)?;
-                            println!("{:?}", config);
-                        }
-                        None => break,
-                    }
-                },
-                _ => unreachable!(),
-            }
-            poll.registry()
-                .reregister(&mut client, IRC_CONN, interest)?;
-        }
-    }
-    Ok(())
 }
 
 fn main() -> Result<(), MainError> {

@@ -7,12 +7,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 
 [[package]]
-name = "irc-rust"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "270dcc5c8fca522796893e260fb0c6ae9b33c2c784d89dc1b1836d8468d0cdfd"
-
-[[package]]
 name = "libc"
 version = "0.2.97"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -91,7 +85,6 @@ dependencies = [
 name = "r8ball"
 version = "0.1.0"
 dependencies = [
- "irc-rust",
  "mio",
  "mio-signals",
  "serde",
