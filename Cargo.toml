@@ -12,3 +12,4 @@ serde = { version = "1.0.97", features = ["derive"] }
 thiserror = "1.0.25"
 mio = { version = "0.7", features = ["net","os-ext"] }
 mio-signals = "0.1.5"
+rand = { version = "0.8.4" , default-features = false, features = ["small_rng"] }

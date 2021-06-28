@@ -72,22 +72,41 @@ impl<'a> Iterator for BufIterator<'a> {
 
 #[cfg(test)]
 mod test {
-    // blank lines should be ignored as being junk
-    const TEST_BODY: &[u8] = b":test 1 2 43
-
-:dsafdsa "; // trailing are indeterminate messages.
+    use super::{BufIterator, TruncStatus};
 
     #[test]
-    fn test_iter() {
-        let iter = super::BufIterator::new(TEST_BODY);
+    fn test_iter_simple() {
+        // blank lines should be ignored as being junk
+        let test_body: &[u8] = b":test 1 2 43
+
+:dsafdsa "; // trailing are indeterminate messages.
+        let iter = BufIterator::new(test_body);
 
         for line in iter {
             match line {
-                super::TruncStatus::Full(x) => {
+                TruncStatus::Full(x) => {
                     assert_eq!(x, b":test 1 2 43")
                 }
-                super::TruncStatus::Part(x) => {
+                TruncStatus::Part(x) => {
                     assert_eq!(x, b":dsafdsa ")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_iter_no_partial() {
+        // blank lines should be ignored as being junk
+        let test_body: &[u8] = b":test 1 2 43\r\n\r\n";
+        let iter = BufIterator::new(test_body);
+
+        for line in iter {
+            match line {
+                TruncStatus::Full(x) => {
+                    assert_eq!(x, b":test 1 2 43")
+                }
+                TruncStatus::Part(x) => {
+                    assert_eq!(x.len(), 0);
                 }
             }
         }

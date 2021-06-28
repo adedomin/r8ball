@@ -34,7 +34,9 @@ pub struct Message<'a> {
     pub user: Option<&'a [u8]>,
     pub host: Option<&'a [u8]>,
     pub command: Option<&'a [u8]>,
-    params: Option<&'a [u8]>,
+    // unparsed parameters slice
+    // consider using the iterator instead.
+    pub params: Option<&'a [u8]>,
 }
 
 pub struct MessageParamIter<'a> {
