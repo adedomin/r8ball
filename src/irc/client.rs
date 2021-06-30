@@ -24,6 +24,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use mio::unix::pipe;
 use rand::{prelude::SmallRng, Rng, SeedableRng};
 
 use crate::{
@@ -35,11 +36,18 @@ use super::iter::BufIterator;
 
 const BUF_SIZ: usize = 1024 * 16;
 
+pub struct Plugin {
+    pub reply: String,
+    pub recv: pipe::Receiver,
+}
+
 pub struct Client {
     pub state: State,
     // If we overrun this massive buffer, we have issues.
     read_buffer: [u8; BUF_SIZ],
     read_head: usize,
+    plugin_buffer: [u8; BUF_SIZ],
+    plugin_head: usize,
     write_buffer: VecDeque<u8>,
     rng: SmallRng,
 }
@@ -120,6 +128,8 @@ impl Client {
             state,
             read_buffer: [0u8; BUF_SIZ],
             read_head: 0,
+            plugin_buffer: [0u8; BUF_SIZ],
+            plugin_head: 0,
             write_buffer: VecDeque::with_capacity(BUF_SIZ),
             rng: SmallRng::seed_from_u64(rng_v),
         };

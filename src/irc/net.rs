@@ -17,11 +17,14 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+use std::collections::HashMap;
+use std::io::Read;
 use std::{io, net::ToSocketAddrs, path::Path};
 
 use std::time::Duration;
 
 use mio::net::TcpStream;
+use mio::unix::pipe;
 use mio::Events;
 use mio::Interest;
 use mio::Poll;
@@ -33,7 +36,7 @@ use mio_signals::Signals;
 use crate::irc::client::{ClientReadStat, ClientWriteStat};
 use crate::{config::config_file::Config, MainError};
 
-use super::client::Client;
+use super::client::{Client, Plugin};
 
 fn open_conn(conn_str: String) -> Result<TcpStream, io::Error> {
     let mut conn_details = conn_str.to_socket_addrs()?;
@@ -60,6 +63,8 @@ pub fn event_loop(config_path: &Path, config: &mut Config) -> Result<(), MainErr
     let mut signals = Signals::new(SignalSet::all())?;
 
     let mut irc_client = Client::new(config);
+    let mut plugin_recv = HashMap::<Token, pipe::Receiver>::new();
+    let mut plugin_buf = [0u8; 4096];
 
     poll.registry()
         .register(&mut conn, IRC_CONN, Interest::READABLE | Interest::WRITABLE)?;
@@ -120,7 +125,28 @@ pub fn event_loop(config_path: &Path, config: &mut Config) -> Result<(), MainErr
                         None => break,
                     }
                 },
-                _ => unreachable!(),
+                _ => {
+                    let ev_tok = event.token();
+                    //if let Some(plug) = plugin_recv.get_mut(&ev_tok) {
+                    //    let size = plug.read(&mut plugin_buf[..])?;
+                    //    loop {
+                    //        match irc_client.write_data(&mut plugin_buf[..size])? {
+                    //            ClientWriteStat::Blocked => break,
+                    //            ClientWriteStat::Okay => (),
+                    //            ClientWriteStat::Eof => {
+                    //                poll.registry().reregister(
+                    //                    &mut conn,
+                    //                    IRC_CONN,
+                    //                    Interest::READABLE,
+                    //                )?;
+                    //                break;
+                    //            }
+                    //        }
+                    //    }
+                    //} else {
+                    //    panic!("We got a token that we should not have!");
+                    //}
+                }
             }
         }
     }

@@ -195,182 +195,176 @@ impl<'a> Message<'a> {
 #[cfg(test)]
 mod test {
     use super::Message;
+
+    fn assert_all_of_the_parameters(
+        m: Message,
+        nick: Option<&[u8]>,
+        user: Option<&[u8]>,
+        host: Option<&[u8]>,
+        command: Option<&[u8]>,
+        params: Option<Vec<&[u8]>>,
+    ) {
+        assert_eq!(m.nick.as_deref(), nick.as_deref());
+        assert_eq!(m.user.as_deref(), user.as_deref());
+        assert_eq!(m.host.as_deref(), host.as_deref());
+        assert_eq!(m.command.as_deref(), command.as_deref());
+        if let Some(params) = params {
+            // zip truncates, make sure the expected counts are comparable.
+            assert_eq!(m.parameters().count(), params.len());
+            let eq_iter = m.parameters().zip(params);
+            for (param, check_param) in eq_iter {
+                assert_eq!(param, check_param);
+            }
+        } else {
+            assert!(m.parameters().next().is_none());
+        }
+    }
+
     #[test]
     fn test_irc_message_parse_full() {
-        let t1 = Message::new(b":happy!test@case command 1 2 3 :trailing param.");
-        assert_eq!(t1.nick.unwrap_or(b""), b"happy");
-        assert_eq!(t1.user.unwrap_or(b""), b"test");
-        assert_eq!(t1.host.unwrap_or(b""), b"case");
-        assert_eq!(t1.command.unwrap_or(b""), b"command");
-        let params = t1.parameters().collect::<Vec<&[u8]>>();
-        assert_eq!(params[0], b"1");
-        assert_eq!(params[1], b"2");
-        assert_eq!(params[2], b"3");
-        assert_eq!(params[3], b"trailing param.");
+        let m = Message::new(b":happy!test@case command 1 2 3 :trailing param.");
+        assert_all_of_the_parameters(
+            m,
+            Some(b"happy"),
+            Some(b"test"),
+            Some(b"case"),
+            Some(b"command"),
+            Some(vec![b"1", b"2", b"3", b"trailing param."]),
+        );
     }
 
     #[test]
     fn test_irc_message_parse_no_prefix() {
-        let t1 = Message::new(b"command 1 2 3 :trailing param.");
-        assert_eq!(t1.nick, None);
-        assert_eq!(t1.user, None);
-        assert_eq!(t1.host, None);
-        // we test the remianing fields parse correctly
-        assert_eq!(t1.command.unwrap_or(b""), b"command");
-        let params = t1.parameters().collect::<Vec<&[u8]>>();
-        assert_eq!(params[0], b"1");
-        assert_eq!(params[1], b"2");
-        assert_eq!(params[2], b"3");
-        assert_eq!(params[3], b"trailing param.");
+        let m = Message::new(b"command 1 2 3 :trailing param.");
+        assert_all_of_the_parameters(
+            m,
+            None,
+            None,
+            None,
+            Some(b"command"),
+            Some(vec![b"1", b"2", b"3", b"trailing param."]),
+        );
     }
 
     #[test]
     fn test_irc_message_parse_prefix_server() {
-        let t1 = Message::new(b":some.irc.server command 1 2 3 :trailing param.");
-        // we just put the server name into the nick field.
-        assert_eq!(t1.nick.unwrap_or(b""), b"some.irc.server");
-        assert_eq!(t1.user, None);
-        assert_eq!(t1.host, None);
-        assert_eq!(t1.command.unwrap_or(b""), b"command");
-        let params = t1.parameters().collect::<Vec<&[u8]>>();
-        assert_eq!(params[0], b"1");
-        assert_eq!(params[1], b"2");
-        assert_eq!(params[2], b"3");
-        assert_eq!(params[3], b"trailing param.");
+        let m = Message::new(b":some.irc.server command 1 2 3 :trailing param.");
+        assert_all_of_the_parameters(
+            m,
+            Some(b"some.irc.server"),
+            None,
+            None,
+            Some(b"command"),
+            Some(vec![b"1", b"2", b"3", b"trailing param."]),
+        );
     }
 
     #[test]
     fn test_irc_message_parse_prefix_user_host_swap() {
-        let t1 = Message::new(b":happy@case!test command 1 2 3 :trailing param.");
-        assert_eq!(t1.nick.unwrap_or(b""), b"happy");
-        assert_eq!(t1.user.unwrap_or(b""), b"test");
-        assert_eq!(t1.host.unwrap_or(b""), b"case");
-        assert_eq!(t1.command.unwrap_or(b""), b"command");
-        let params = t1.parameters().collect::<Vec<&[u8]>>();
-        assert_eq!(params[0], b"1");
-        assert_eq!(params[1], b"2");
-        assert_eq!(params[2], b"3");
-        assert_eq!(params[3], b"trailing param.");
+        let m = Message::new(b":happy@case!test command 1 2 3 :trailing param.");
+        assert_all_of_the_parameters(
+            m,
+            Some(b"happy"),
+            Some(b"test"),
+            Some(b"case"),
+            Some(b"command"),
+            Some(vec![b"1", b"2", b"3", b"trailing param."]),
+        );
     }
 
     #[test]
     fn test_irc_message_parse_prefix_blank() {
-        let t1 = Message::new(b": com arg1 arg2");
-        // an empty prefix means nick will point to an empty slice
-        assert_eq!(t1.nick.unwrap_or(b"fafdsaf"), b"");
-        assert_eq!(t1.user, None);
-        assert_eq!(t1.host, None);
-        assert_eq!(t1.command.unwrap_or(b""), b"com");
-        let params = t1.parameters().collect::<Vec<&[u8]>>();
-        assert_eq!(params[0], b"arg1");
-        assert_eq!(params[1], b"arg2");
+        let m = Message::new(b": com arg1 arg2");
+        assert_all_of_the_parameters(
+            m,
+            Some(b""), // hard to say what the intended behavior would be, leave it as an "empty" sender.
+            None,
+            None,
+            Some(b"com"),
+            Some(vec![b"arg1", b"arg2"]),
+        );
     }
 
     #[test]
     fn test_irc_message_parse_prefix_no_user() {
-        let t1 = Message::new(b":x@y com arg1 arg2");
-        // an empty prefix means nick will point to an empty slice
-        assert_eq!(t1.nick.unwrap_or(b""), b"x");
-        assert_eq!(t1.user, None);
-        assert_eq!(t1.host.unwrap_or(b""), b"y");
-        assert_eq!(t1.command.unwrap_or(b""), b"com");
-        let params = t1.parameters().collect::<Vec<&[u8]>>();
-        assert_eq!(params[0], b"arg1");
-        assert_eq!(params[1], b"arg2");
+        let m = Message::new(b":x@y com arg1 arg2");
+        assert_all_of_the_parameters(
+            m,
+            Some(b"x"),
+            None,
+            Some(b"y"),
+            Some(b"com"),
+            Some(vec![b"arg1", b"arg2"]),
+        );
     }
 
     #[test]
     fn test_irc_message_parse_prefix_no_host() {
-        let t1 = Message::new(b":x!y com arg1 arg2");
-        // an empty prefix means nick will point to an empty slice
-        assert_eq!(t1.nick.unwrap_or(b""), b"x");
-        assert_eq!(t1.user.unwrap_or(b""), b"y");
-        assert_eq!(t1.host, None);
-        assert_eq!(t1.command.unwrap_or(b""), b"com");
-        let params = t1.parameters().collect::<Vec<&[u8]>>();
-        assert_eq!(params[0], b"arg1");
-        assert_eq!(params[1], b"arg2");
+        let m = Message::new(b":x!y com arg1 arg2");
+        assert_all_of_the_parameters(
+            m,
+            Some(b"x"),
+            Some(b"y"),
+            None,
+            Some(b"com"),
+            Some(vec![b"arg1", b"arg2"]),
+        );
     }
 
     #[test]
     fn test_irc_message_parse_prefix_only() {
-        let t1 = Message::new(b":x!y@z");
-        assert_eq!(t1.nick.unwrap_or(b""), b"x");
-        assert_eq!(t1.user.unwrap_or(b""), b"y");
-        assert_eq!(t1.host.unwrap_or(b""), b"z");
-        assert_eq!(t1.command, None);
-        assert!(t1.parameters().next().is_none());
+        let m = Message::new(b":x!y@z");
+        assert_all_of_the_parameters(m, Some(b"x"), Some(b"y"), Some(b"z"), None, None);
     }
 
     #[test]
     fn test_irc_message_parse_command_only() {
-        let t1 = Message::new(b"PING");
-        assert_eq!(t1.nick, None);
-        assert_eq!(t1.user, None);
-        assert_eq!(t1.host, None);
-        assert_eq!(t1.command.unwrap_or(b""), b"PING");
-        assert!(t1.parameters().next().is_none());
+        let m = Message::new(b"PING");
+        assert_all_of_the_parameters(m, None, None, None, Some(b"PING"), None);
     }
 
     #[test]
     fn test_irc_message_parse_command_trailing_only() {
-        let t1 = Message::new(b"PING : PONG");
-        assert_eq!(t1.nick, None);
-        assert_eq!(t1.user, None);
-        assert_eq!(t1.host, None);
-        assert_eq!(t1.command.unwrap_or(b""), b"PING");
-        let params = t1.parameters().collect::<Vec<&[u8]>>();
-        assert_eq!(params[0], b" PONG");
+        let m = Message::new(b"PING : PONG");
+        assert_all_of_the_parameters(m, None, None, None, Some(b"PING"), Some(vec![b" PONG"]));
     }
 
     #[test]
     fn test_irc_message_parse_command_trailing_blank() {
-        let t1 = Message::new(b"PING :");
-        assert_eq!(t1.nick, None);
-        assert_eq!(t1.user, None);
-        assert_eq!(t1.host, None);
-        assert_eq!(t1.command.unwrap_or(b""), b"PING");
-        let params = t1.parameters().collect::<Vec<&[u8]>>();
-        assert_eq!(params[0], b"");
+        let m = Message::new(b"PING :");
+        assert_all_of_the_parameters(m, None, None, None, Some(b"PING"), Some(vec![b""]));
     }
 
     #[test]
     fn test_irc_message_parse_weird_spacing() {
-        let t1 = Message::new(b":x     command    arg1  arg2        :     afdasfda  fdas   a .");
-        assert_eq!(t1.nick.unwrap_or(b""), b"x");
-        assert_eq!(t1.user, None);
-        assert_eq!(t1.host, None);
-        assert_eq!(t1.command.unwrap_or(b""), b"command");
-        let params = t1.parameters().collect::<Vec<&[u8]>>();
-        assert_eq!(params[0], b"arg1");
-        assert_eq!(params[1], b"arg2");
-        assert_eq!(params[2], b"     afdasfda  fdas   a .");
+        let m = Message::new(b":x     command    arg1  arg2        :     afdasfda  fdas   a .");
+        assert_all_of_the_parameters(
+            m,
+            Some(b"x"),
+            None,
+            None,
+            Some(b"command"),
+            Some(vec![b"arg1", b"arg2", b"     afdasfda  fdas   a ."]),
+        );
     }
 
     #[test]
     fn test_irc_message_parse_weird_spacing_no_trailer() {
-        let t1 = Message::new(b":x     command    arg1  arg2             afdasfda  fdas   a .  ");
-        assert_eq!(t1.nick.unwrap_or(b""), b"x");
-        assert_eq!(t1.user, None);
-        assert_eq!(t1.host, None);
-        assert_eq!(t1.command.unwrap_or(b""), b"command");
-        let params = t1.parameters().collect::<Vec<&[u8]>>();
-        assert_eq!(params[0], b"arg1");
-        assert_eq!(params[1], b"arg2");
-        assert_eq!(params[2], b"afdasfda");
-        assert_eq!(params[3], b"fdas");
-        assert_eq!(params[4], b"a");
-        assert_eq!(params[5], b".");
+        let m = Message::new(b":x     command    arg1  arg2             afdasfda  fdas   a .  ");
+        assert_all_of_the_parameters(
+            m,
+            Some(b"x"),
+            None,
+            None,
+            Some(b"command"),
+            Some(vec![b"arg1", b"arg2", b"afdasfda", b"fdas", b"a", b"."]),
+        );
     }
 
     #[test]
     fn test_irc_message_parse_weird_spacing_no_param() {
-        let t1 = Message::new(b":x     command                 ");
-        assert_eq!(t1.nick.unwrap_or(b""), b"x");
-        assert_eq!(t1.user, None);
-        assert_eq!(t1.host, None);
-        assert_eq!(t1.command.unwrap_or(b""), b"command");
-        assert!(t1.parameters().next().is_none());
+        let m = Message::new(b":x     command                 ");
+        assert_all_of_the_parameters(m, Some(b"x"), None, None, Some(b"command"), None);
     }
 
     #[test]
