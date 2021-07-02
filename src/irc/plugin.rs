@@ -20,7 +20,7 @@
 use std::{
     io::{self, Read},
     os::unix::prelude::{FromRawFd, IntoRawFd},
-    process::{self, ExitStatus, Stdio},
+    process::{self, Child, ExitStatus, Stdio},
     sync::{Arc, Mutex},
     thread,
 };
@@ -33,6 +33,7 @@ pub enum PluginReadStat {
     Okay,
     Eof,
     Blocked,
+    ReadBufferFull,
 }
 
 /// An r8b plugin, its receiver and exit status.
@@ -40,42 +41,76 @@ pub struct Plugin {
     /// The exit status of the plugin.
     /// You can use the is_read_closed() event in mio to know when this field should be set.
     pub exit_code: Arc<Mutex<Option<io::Result<ExitStatus>>>>,
-    pub read_buf: [u8; 512],
+    read_buf: [u8; 512],
+    read_start: usize,
     read_len: usize,
     pipe: pipe::Receiver,
+    discard_out: bool,
 }
 
 impl Plugin {
     pub fn new(command: String, args: Vec<String>) -> io::Result<Self> {
         let (send, recv) = pipe::new()?;
         let exit_code = Arc::new(Mutex::new(None));
-        let ecode_2 = exit_code.clone();
+        let thread_ecode = exit_code.clone();
 
         thread::spawn(move || {
-            let ecode = match process::Command::new(command)
-                .stdin(Stdio::null())
-                .stderr(Stdio::inherit())
-                .stdout(unsafe { Stdio::from_raw_fd(send.into_raw_fd()) })
-                .args(args)
-                .spawn()
-            {
-                Ok(mut child) => child.wait(),
-                Err(e) => Err(e),
-            };
-
-            let mut e = ecode_2.lock().expect("Could not lock plugin status field.");
-            *e = Some(ecode);
+            let mut ecode = thread_ecode
+                .lock()
+                .expect("Could not lock plugin status field.");
+            *ecode = Some(
+                process::Command::new(command)
+                    .stdin(Stdio::null())
+                    .stderr(Stdio::inherit())
+                    .stdout(unsafe { Stdio::from_raw_fd(send.into_raw_fd()) })
+                    .args(args)
+                    .spawn()
+                    .and_then(|mut child: Child| -> io::Result<ExitStatus> { child.wait() }),
+            );
         });
 
         Ok(Plugin {
             exit_code,
             read_buf: [0u8; 512],
+            read_start: 0,
             read_len: 0,
             pipe: recv,
+            discard_out: false,
         })
     }
 
+    pub fn get_buf(&self) -> &[u8] {
+        &self.read_buf[..self.read_len]
+    }
+
     pub fn receive(&mut self) -> io::Result<PluginReadStat> {
+        if self.read_len == self.read_buf.len() {
+            // We cannot continue if the whole buffer cannot be processed
+            // We check if it can be, else we attach a newline to the body.
+            // this may cause gibberish to be sent to the server, but it is better
+            // than deadlocking.
+            if !self.read_buf.iter().any(|&chr| chr == b'\n') {
+                self.read_buf
+                    .last_mut()
+                    .and_then(|refer: &mut u8| {
+                        *refer = b'\n';
+                        Some(())
+                    })
+                    .unwrap();
+                // Because the rest of the output may have been broken by the above,
+                // we set this flag that tells us to discard the remaining undelimited content.
+                self.discard_out = true;
+            }
+            // We can't read more til we process this buffer.
+            return Ok(PluginReadStat::ReadBufferFull);
+        }
+
+        if self.read_start != 0 {
+            self.read_buf.copy_within(self.read_start..self.read_len, 0);
+            self.read_len -= self.read_start;
+            self.read_start = 0;
+        }
+
         let size = match self.pipe.read(&mut self.read_buf[self.read_len..]) {
             Ok(s) if s == 0 => return Ok(PluginReadStat::Eof),
             Ok(s) => s,
@@ -85,22 +120,42 @@ impl Plugin {
             Err(e) => return Err(e),
         };
 
-        self.read_len += size;
+        if !self.discard_out {
+            self.read_len += size;
+        } else if self.discard_out {
+            // We never increment read_len when discarding. safe to assume it is 0
+            if let Some(pos) = self.read_buf[self.read_len..size]
+                .iter()
+                .position(|&chr| chr == b'\n')
+            {
+                self.read_buf.copy_within(pos..size, 0);
+                // subtract the read size by the amount of bytes we cut off.
+                self.read_len = size - pos;
+                self.discard_out = false;
+            }
+        }
 
         Ok(PluginReadStat::Okay)
+    }
+
+    pub fn split_at(&mut self, pos: usize) {
+        if pos == 0 {
+            self.reset_buf();
+        } else {
+            self.read_start = pos;
+        }
+    }
+
+    pub fn get_slice_pos(&self, slice: &[u8]) -> usize {
+        self.read_buf.as_ptr() as usize - slice.as_ptr() as usize
     }
 
     pub fn iter(&self) -> BufIterator {
         BufIterator::new(&self.read_buf[..self.read_len])
     }
 
-    /// Useful helper to move line content which is not delimited.
-    pub fn move_to_front(&mut self, slice: &[u8]) {
-        let start = self.read_buf.as_ptr() as usize - slice.as_ptr() as usize;
-        let mv = &mut self.read_buf[0..slice.len() + start];
-        mv.copy_within(start.., 0);
-        // truncate remaining content.
-        self.read_len = slice.len();
+    pub fn reset_buf(&mut self) {
+        self.read_len = 0;
     }
 }
 
@@ -132,7 +187,7 @@ impl Source for Plugin {
 mod test {
     use std::time::Duration;
 
-    use crate::irc::{iter::TruncStatus, plugin::PluginReadStat};
+    use crate::irc::{iter::TruncStatus, parse::Message, plugin::PluginReadStat};
 
     use super::Plugin;
     use mio::{Events, Interest, Poll, Token};
@@ -163,6 +218,7 @@ mod test {
                                     PluginReadStat::Okay => (),
                                     PluginReadStat::Eof => break 'outer,
                                     PluginReadStat::Blocked => break,
+                                    PluginReadStat::ReadBufferFull => break,
                                 }
                             }
                         } else if event.is_read_closed() {
@@ -188,5 +244,116 @@ mod test {
             }
         }
         assert!(has_output);
+    }
+
+    #[test]
+    fn large_output_truncation() {
+        let plugin_file = format!(
+            "{}/examples/plugins/big_output.sh",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut plug = Plugin::new(plugin_file, vec![]).unwrap();
+
+        loop {
+            match plug.receive().unwrap() {
+                PluginReadStat::Okay => (),
+                PluginReadStat::Eof => break,
+                PluginReadStat::Blocked => (),
+                PluginReadStat::ReadBufferFull => {
+                    for out in plug.iter() {
+                        match out {
+                            TruncStatus::Full(out) => {
+                                let m = Message::new(out);
+                                let p = m.parameters().collect::<Vec<&[u8]>>();
+
+                                assert_eq!(m.command.as_deref(), Some(&b"PRIVMSG"[..]));
+                                assert_eq!(p[0], b"#test");
+                                // trailing a should not be in this message.
+                                assert!(!p[1].iter().any(|&chr| chr != b' '));
+                            }
+                            TruncStatus::Part(_) => {
+                                panic!("We should have truncated output and appended a newline!")
+                            }
+                        };
+                    }
+                    plug.reset_buf();
+                }
+            }
+        }
+
+        for out in plug.iter() {
+            match out {
+                TruncStatus::Full(out) => {
+                    let m = Message::new(out);
+                    let p = m.parameters().collect::<Vec<&[u8]>>();
+
+                    assert_eq!(m.command.as_deref(), Some(&b"PRIVMSG"[..]));
+                    assert_eq!(p[0], b"#test");
+                    assert_eq!(p[1], b"Hello, World!");
+                }
+                TruncStatus::Part(_) => {
+                    panic!("We should have truncated output and appended a newline!")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_partial_trunc() {
+        let plugin_file = format!(
+            "{}/examples/plugins/truncated_read.sh",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut plug = Plugin::new(plugin_file, vec![]).unwrap();
+
+        loop {
+            match plug.receive().unwrap() {
+                PluginReadStat::Okay => (),
+                PluginReadStat::Eof => break,
+                PluginReadStat::Blocked => (),
+                PluginReadStat::ReadBufferFull => {
+                    let mut split_at = 0usize;
+                    for out in plug.iter() {
+                        match out {
+                            TruncStatus::Full(out) => {
+                                let m = Message::new(out);
+                                let p = m.parameters().collect::<Vec<&[u8]>>();
+
+                                assert_eq!(m.command.as_deref(), Some(&b"PRIVMSG"[..]));
+                                assert_eq!(p[0], b"#test");
+                                // trailing a should not be in this message.
+                                assert!(!p[1]
+                                    .iter()
+                                    .last()
+                                    .and_then(|&chr| if chr == b'a' { Some(()) } else { None })
+                                    .is_some());
+                            }
+                            TruncStatus::Part(out) => {
+                                split_at = plug.get_slice_pos(out);
+                            }
+                        };
+                    }
+                    // we should have truncated data.
+                    assert!(split_at != 0);
+                    plug.split_at(split_at);
+                }
+            }
+        }
+
+        for out in plug.iter() {
+            match out {
+                TruncStatus::Full(out) => {
+                    let m = Message::new(out);
+                    let p = m.parameters().collect::<Vec<&[u8]>>();
+
+                    assert_eq!(m.command.as_deref(), Some(&b"PRIVMSG"[..]));
+                    assert_eq!(p[0], b"#test");
+                    assert_eq!(p[1], b"Hello, World!");
+                }
+                TruncStatus::Part(_) => {
+                    panic!("We should not have truncated output!")
+                }
+            }
+        }
     }
 }

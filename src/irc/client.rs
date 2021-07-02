@@ -24,7 +24,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use mio::unix::pipe;
 use rand::{prelude::SmallRng, Rng, SeedableRng};
 
 use crate::{
@@ -32,14 +31,9 @@ use crate::{
     irc::{iter::TruncStatus, parse::Message},
 };
 
-use super::iter::BufIterator;
+use super::{iter::BufIterator, plugin::Plugin};
 
 const BUF_SIZ: usize = 1024 * 16;
-
-pub struct Plugin {
-    pub reply: String,
-    pub recv: pipe::Receiver,
-}
 
 pub struct Client {
     pub state: State,
@@ -52,16 +46,12 @@ pub struct Client {
     rng: SmallRng,
 }
 
-enum ModeTracker {
-    On,
-    Off,
-}
-
+#[derive(PartialEq)]
 enum IrcState {
     Unknown,
     PreAuth,
     Authenticated,
-    Ready(ModeTracker),
+    Ready(bool),
 }
 
 pub struct State {
@@ -85,7 +75,15 @@ pub struct State {
 }
 
 #[derive(Debug, PartialEq)]
+pub enum IrcProto {
+    Okay,
+    Data,
+    Error(String),
+}
+
+#[derive(Debug, PartialEq)]
 pub enum ClientReadStat {
+    Error(String),
     ReadBufferFull,
     HasWritableData,
     Blocked,
@@ -108,6 +106,83 @@ USER {1} +i * :{0}\r
 ",
         nick, user
     )
+}
+
+enum ModeType {
+    Type1, // has a parameter
+    Type2, // has a parameter
+    Type3, // has a parameter if positive signed + (not -)
+           // Type4, // This mode isn't relevant for our uses, effectively no parameter.
+}
+
+macro_rules! hashmap {
+    // map-like
+    ($($k:expr => $v:expr),* $(,)?) => {
+        std::iter::Iterator::collect(std::array::IntoIter::new([$(($k, $v),)*]))
+    };
+}
+
+fn handle_005(m: Message) -> HashMap<u8, ModeType> {
+    if let Some(isupport) = m.parameters().find(|s| s.starts_with(b"ISUPPORT=")) {
+        let mut map = HashMap::new();
+        let rhs = &isupport["ISUPPORT=".len()..];
+        let mut modegrp_iter = rhs.split(|&chr| chr == b',');
+
+        if let Some(type1) = modegrp_iter.next() {
+            for &chr in type1.iter() {
+                map.insert(chr, ModeType::Type1);
+            }
+        }
+        if let Some(type2) = modegrp_iter.next() {
+            for &chr in type2.iter() {
+                map.insert(chr, ModeType::Type2);
+            }
+        }
+        if let Some(type3) = modegrp_iter.next() {
+            for &chr in type3.iter() {
+                map.insert(chr, ModeType::Type3);
+            }
+        }
+
+        map
+    } else {
+        // sane defaults assuming we don't get an answer.
+        hashmap![
+            b'b' => ModeType::Type1,
+            b'e' => ModeType::Type1,
+            b'i' => ModeType::Type1,
+            b'k' => ModeType::Type2,
+            b'l' => ModeType::Type3,
+        ]
+    }
+}
+
+fn join_part_channels(command: &[u8], channels: &Vec<String>) -> Vec<u8> {
+    let mut ret = vec![];
+    let mut lsize = ret.len();
+    let mut first = true;
+
+    for channel in channels {
+        if channel.len() + lsize >= 510 {
+            lsize = 0usize;
+            first = true;
+            ret.extend(b"\r\n");
+        }
+
+        if !first {
+            ret.push(b',');
+        } else {
+            ret.extend(command);
+            ret.push(b' ');
+            lsize = command.len();
+            first = false;
+        }
+        ret.extend(channel.as_bytes());
+        lsize += channel.len() + 1;
+    }
+    ret.extend(b"\r\n");
+
+    ret
 }
 
 impl Client {
@@ -139,8 +214,37 @@ impl Client {
         ret
     }
 
-    fn handle_data(&mut self, len: usize) -> bool {
-        let mut ret = false;
+    /// Parse the CAP command from the server
+    /// Messages usually look like -> :server CAP YOUR_NICK ACK :cap1 [cap2...]
+    /// We currently only handle ACK for multi-prefix with a future use of
+    /// sasl to come.
+    fn parse_cap(m: Message) -> bool {
+        let mut piter = m.parameters();
+
+        // We throw away the nickmake parameter
+        if piter.next().is_none() {
+            return false; // we have an error.
+        }
+        if let Some(ack) = piter.next() {
+            if ack == b"ACK" {
+                return false;
+            }
+        } else {
+            // not enough params
+            return false;
+        }
+
+        if let Some(caplist) = piter.next() {
+            caplist
+                .split(|&chr| chr == b' ')
+                .any(|cap| cap == b"multi-prefix")
+        } else {
+            false
+        }
+    }
+
+    fn handle_data(&mut self, len: usize) -> IrcProto {
+        let mut ret = IrcProto::Okay;
         let mut partial_idx = 0usize;
         let mut partial_end = 0usize;
 
@@ -167,16 +271,17 @@ impl Client {
                             self.write_buffer.extend(params)
                         }
                         self.write_buffer.extend(b"\r\n");
-                        ret = true;
+                        ret = IrcProto::Data;
                     }
                     Some(cmd) if cmd == b"ERROR" => {
                         if let Some(params) = msg.params {
                             let str_v = String::from_utf8_lossy(params);
                             println!("Recv error: {:?}", str_v);
+                            return IrcProto::Error("We are banned.".to_owned());
                         }
                         // quit the stream
                         self.write_buffer.extend(b"QUIT :bye\r\n");
-                        ret = true;
+                        ret = IrcProto::Data;
                     }
                     Some(cmd) => {
                         let str_v = String::from_utf8_lossy(cmd);
@@ -203,6 +308,25 @@ impl Client {
                         }
                     }
                 }
+                Some(privmsg) if privmsg == b"PRIVMSG" || privmsg == b"NOTICE" => {}
+                Some(join) if join == b"JOIN" => {}
+                Some(part) if part == b"PART" => {}
+                Some(kick) if kick == b"KICK" => {}
+                Some(invite) if invite == b"INVITE" => {}
+                Some(identified) if identified == b"004" => {
+                    self.state.ready_state = IrcState::Ready(false);
+                    todo!() // send join channel commands
+                }
+                Some(isupport) if isupport == b"005" => {
+                    self.state.ready_state = IrcState::Ready(true);
+                    todo!(); // parse ISUPPORT
+                }
+                // reply to NAMES(X) Command or message sent on joining a channel
+                Some(names_repl) if names_repl == b"353" => {
+                    if self.state.ready_state == IrcState::Ready(true) {
+                        todo!()
+                    }
+                }
                 // nickname collision
                 Some(nick_col) if nick_col == b"433" || nick_col == b"436" => {
                     if self.state.original_nick.is_none() {
@@ -219,7 +343,30 @@ impl Client {
                     self.write_buffer
                         .extend(format!("NICK {}\r\n", self.state.nick).as_bytes());
                     println!("WARN: NICK COLLIDE; Trying new nick: {:?}", self.state.nick);
-                    ret = true;
+                    ret = IrcProto::Data;
+                }
+                Some(bad_pass) if bad_pass == b"464" => {
+                    return IrcProto::Error("Invalid password given in PASS command.".to_owned());
+                }
+                Some(banned) if banned == b"465" => {
+                    return IrcProto::Error("We are banned.".to_owned());
+                }
+                Some(cap) if cap == b"CAP" => {}
+                Some(cap) if cap == b"903" => {
+                    todo!() // implement sasl challenge & response
+                }
+                Some(cap)
+                    if cap == b"902"
+                        || cap == b"903"
+                        || cap == b"904"
+                        || cap == b"905"
+                        || cap == b"906" =>
+                {
+                    return IrcProto::Error("We had an SASL problem.".to_owned());
+                }
+                Some(pong) if pong == b"PONG" => {
+                    println!("DEBUG: PONG recv. TODO");
+                    todo!()
                 }
                 Some(any) => {
                     let str_v = String::from_utf8_lossy(any);
@@ -248,18 +395,44 @@ impl Client {
 
         let buf = &mut self.read_buffer[self.read_head..];
         let size = match readable.read(buf) {
+            Ok(size) if size == 0 => return Ok(ClientReadStat::Eof),
             Ok(size) => size + self.read_head,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(ClientReadStat::Blocked),
             Err(e) => return Err(e),
         };
 
-        if self.handle_data(size) {
-            Ok(ClientReadStat::HasWritableData)
-        } else if size > 0 {
-            Ok(ClientReadStat::Okay)
-        } else {
-            Ok(ClientReadStat::Eof)
+        match self.handle_data(size) {
+            IrcProto::Okay => Ok(ClientReadStat::Okay),
+            IrcProto::Data => Ok(ClientReadStat::HasWritableData),
+            IrcProto::Error(e) => Ok(ClientReadStat::Error(e)),
         }
+    }
+
+    pub fn process_plugin(&mut self, plug: &mut Plugin) -> bool {
+        let mut has_data = false;
+        let mut has_trunc = false;
+        let mut slice_at = 0usize;
+        for line in plug.iter() {
+            match line {
+                // todo, implement command lang?
+                TruncStatus::Full(data) => {
+                    has_data = true;
+                    self.write_buffer.extend(data);
+                    self.write_buffer.extend(b"\r\n");
+                }
+                TruncStatus::Part(partial) => {
+                    has_trunc = true;
+                    slice_at = plug.get_slice_pos(partial);
+                }
+            }
+        }
+
+        if !has_trunc {
+            plug.reset_buf();
+            plug.split_at(slice_at);
+        }
+
+        has_data
     }
 
     pub fn write_data<T: Write>(&mut self, writable: &mut T) -> Result<ClientWriteStat, io::Error> {
@@ -304,9 +477,17 @@ impl Client {
 mod test {
     use std::io::{Cursor, Write};
 
-    use crate::{config::config_file::Config, irc::parse::Message};
+    use rand::{prelude::SmallRng, Rng, SeedableRng};
 
-    use super::{Client, ClientReadStat, ClientWriteStat};
+    use crate::{
+        config::config_file::Config,
+        irc::{
+            iter::{BufIterator, TruncStatus},
+            parse::Message,
+        },
+    };
+
+    use super::{join_part_channels, Client, ClientReadStat, ClientWriteStat};
     const DEFAULT_CONF: &str = r##"
 [general]
 nick = "bot"
@@ -467,5 +648,42 @@ USER bot +i * :bot\r
         assert_eq!(m.command.unwrap(), b"NICK");
         assert_eq!(&m.params.unwrap()[..4], b"bot_");
         assert_ne!(m.params.unwrap(), b"bot");
+    }
+
+    #[test]
+    fn mass_channel_join() {
+        let mut prng = SmallRng::seed_from_u64(123456789);
+        let mut channels = Vec::new();
+        while channels.len() < 256 {
+            let mut channel = "#".to_owned();
+            while channel.len() < 30 {
+                channel.push(prng.gen_range('a'..'z'));
+                if prng.gen_bool(1.0 / 15.0) {
+                    break;
+                }
+            }
+            channels.push(channel);
+        }
+
+        let mut channels2: Vec<String> = Vec::new();
+        let res = join_part_channels(b"JOIN", &channels);
+        for line in BufIterator::new(&res) {
+            match line {
+                TruncStatus::Full(msg) => {
+                    assert!(msg.len() <= 512);
+                    let m = Message::new(msg);
+                    let list = m.parameters().next().unwrap();
+                    for chan in list.split(|&chr| chr == b',') {
+                        channels2.push(String::from_utf8_lossy(chan).to_string());
+                    }
+                }
+                TruncStatus::Part(_) => panic!("shouldn't happen."),
+            }
+        }
+
+        assert_eq!(channels.len(), channels2.len());
+        for (lhs, rhs) in channels.iter().zip(channels2.iter()) {
+            assert_eq!(lhs, rhs);
+        }
     }
 }

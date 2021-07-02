@@ -35,6 +35,8 @@ pub enum MainError {
     Config(#[from] ConfigError),
     #[error("")]
     EvIo(#[from] io::Error),
+    #[error("ERROR: {0}")]
+    IrcProto(String),
 }
 
 fn main() -> Result<(), MainError> {

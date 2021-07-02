@@ -18,13 +18,11 @@
 // THE SOFTWARE.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::{io, net::ToSocketAddrs, path::Path};
 
 use std::time::Duration;
 
 use mio::net::TcpStream;
-use mio::unix::pipe;
 use mio::Events;
 use mio::Interest;
 use mio::Poll;
@@ -36,7 +34,8 @@ use mio_signals::Signals;
 use crate::irc::client::{ClientReadStat, ClientWriteStat};
 use crate::{config::config_file::Config, MainError};
 
-use super::client::{Client, Plugin};
+use super::client::Client;
+use super::plugin::{Plugin, PluginReadStat};
 
 fn open_conn(conn_str: String) -> Result<TcpStream, io::Error> {
     let mut conn_details = conn_str.to_socket_addrs()?;
@@ -63,8 +62,7 @@ pub fn event_loop(config_path: &Path, config: &mut Config) -> Result<(), MainErr
     let mut signals = Signals::new(SignalSet::all())?;
 
     let mut irc_client = Client::new(config);
-    let mut plugin_recv = HashMap::<Token, pipe::Receiver>::new();
-    let mut plugin_buf = [0u8; 4096];
+    let mut plugin_recv = HashMap::<Token, Plugin>::new();
 
     poll.registry()
         .register(&mut conn, IRC_CONN, Interest::READABLE | Interest::WRITABLE)?;
@@ -94,6 +92,7 @@ pub fn event_loop(config_path: &Path, config: &mut Config) -> Result<(), MainErr
                                 ClientReadStat::Blocked => break,
                                 ClientReadStat::Okay => (),
                                 ClientReadStat::Eof => break 'outer,
+                                ClientReadStat::Error(err) => return Err(MainError::IrcProto(err)),
                             }
                         }
                     } else {
@@ -127,25 +126,41 @@ pub fn event_loop(config_path: &Path, config: &mut Config) -> Result<(), MainErr
                 },
                 _ => {
                     let ev_tok = event.token();
-                    //if let Some(plug) = plugin_recv.get_mut(&ev_tok) {
-                    //    let size = plug.read(&mut plugin_buf[..])?;
-                    //    loop {
-                    //        match irc_client.write_data(&mut plugin_buf[..size])? {
-                    //            ClientWriteStat::Blocked => break,
-                    //            ClientWriteStat::Okay => (),
-                    //            ClientWriteStat::Eof => {
-                    //                poll.registry().reregister(
-                    //                    &mut conn,
-                    //                    IRC_CONN,
-                    //                    Interest::READABLE,
-                    //                )?;
-                    //                break;
-                    //            }
-                    //        }
-                    //    }
-                    //} else {
-                    //    panic!("We got a token that we should not have!");
-                    //}
+                    if let Some(plug) = plugin_recv.get_mut(&ev_tok) {
+                        loop {
+                            match plug.receive()? {
+                                PluginReadStat::Okay => (),
+                                PluginReadStat::Eof => break,
+                                PluginReadStat::Blocked => break,
+                                // buffer needs to processed to make progress
+                                PluginReadStat::ReadBufferFull => {
+                                    // If true, we have writable data
+                                    if irc_client.process_plugin(plug) {
+                                        poll.registry().reregister(
+                                            &mut conn,
+                                            IRC_CONN,
+                                            Interest::READABLE | Interest::WRITABLE,
+                                        )?;
+                                    }
+                                }
+                            }
+                        }
+
+                        // If true, we have writable data
+                        if irc_client.process_plugin(plug) {
+                            poll.registry().reregister(
+                                &mut conn,
+                                IRC_CONN,
+                                Interest::READABLE | Interest::WRITABLE,
+                            )?;
+                        }
+
+                        if event.is_read_closed() {
+                            plugin_recv.remove(&ev_tok).expect("Cannot remove plugin!");
+                        }
+                    } else {
+                        panic!("We got a token that we should not have!");
+                    }
                 }
             }
         }

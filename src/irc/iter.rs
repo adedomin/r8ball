@@ -55,10 +55,14 @@ impl<'a> Iterator for BufIterator<'a> {
     type Item = TruncStatus<&'a [u8]>;
     fn next(&mut self) -> Option<Self::Item> {
         let buf: &'a [u8] = &self.buffer[self.read_head..];
-        let buf = match find_start(buf) {
-            Some(start) => &buf[start..],
+        let start = match find_start(buf) {
+            Some(start) => start,
             None => return None,
         };
+
+        // remove leading delimiter.
+        self.read_head += start;
+        let buf = &buf[start..];
 
         if let Some(eom) = find_eom(buf) {
             self.read_head += eom + 1;
@@ -97,7 +101,7 @@ mod test {
     #[test]
     fn test_iter_no_partial() {
         // blank lines should be ignored as being junk
-        let test_body: &[u8] = b":test 1 2 43\r\n\r\n";
+        let test_body: &[u8] = b":test 1 2 43\r\n";
         let iter = BufIterator::new(test_body);
 
         for line in iter {
