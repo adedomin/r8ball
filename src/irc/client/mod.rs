@@ -17,9 +17,11 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+mod helpers;
+
 use std::{
     cmp,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::{self, Read, Write},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -28,10 +30,17 @@ use rand::{prelude::SmallRng, Rng, SeedableRng};
 
 use crate::{
     config::config_file::Config,
-    irc::{iter::TruncStatus, parse::Message},
+    irc::{
+        client::helpers::{case_cmp, join_channels, parse_cap},
+        iter::TruncStatus,
+        parse::Message,
+    },
 };
 
-use super::{iter::BufIterator, plugin::Plugin};
+use super::{
+    iter::BufIterator,
+    plugin::{Plugin, PluginReadStat},
+};
 
 const BUF_SIZ: usize = 1024 * 16;
 
@@ -40,8 +49,6 @@ pub struct Client {
     // If we overrun this massive buffer, we have issues.
     read_buffer: [u8; BUF_SIZ],
     read_head: usize,
-    plugin_buffer: [u8; BUF_SIZ],
-    plugin_head: usize,
     write_buffer: VecDeque<u8>,
     rng: SmallRng,
 }
@@ -54,12 +61,18 @@ enum IrcState {
     Ready(bool),
 }
 
+#[derive(PartialEq)]
+pub enum CaseMapping {
+    Ascii,
+    Rfc1459,
+    Unicode, // ???
+}
+
 pub struct State {
     pub nick: String,
     pub channels: Vec<String>,
     // Modes are detected at runtime since each server has different ones
-    // which is why this type is simply a 64 bit unsigned integer.
-    pub umode: u64,
+    pub umode: HashSet<u8>,
     // This only tracks the modes related to administrative privileges
     // For instance, this tracks if a user is +v (voiced) or is +o (op).
     // Much like umodes, these vary from server to server and are detected
@@ -72,6 +85,13 @@ pub struct State {
     ready_state: IrcState,
     // the old name we expected to have
     original_nick: Option<String>,
+
+    // This is state related to 005 command
+    casemapping: CaseMapping,
+    // list of channel prefixes that are valid. e.g. #&!
+    chantypes: Vec<u8>,
+    // e.g. +v maps to +, o maps to @, etc.
+    mode_prefix: Vec<(u8, u8)>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -115,85 +135,18 @@ enum ModeType {
            // Type4, // This mode isn't relevant for our uses, effectively no parameter.
 }
 
-macro_rules! hashmap {
-    // map-like
-    ($($k:expr => $v:expr),* $(,)?) => {
-        std::iter::Iterator::collect(std::array::IntoIter::new([$(($k, $v),)*]))
-    };
-}
-
-fn handle_005(m: Message) -> HashMap<u8, ModeType> {
-    if let Some(isupport) = m.parameters().find(|s| s.starts_with(b"ISUPPORT=")) {
-        let mut map = HashMap::new();
-        let rhs = &isupport["ISUPPORT=".len()..];
-        let mut modegrp_iter = rhs.split(|&chr| chr == b',');
-
-        if let Some(type1) = modegrp_iter.next() {
-            for &chr in type1.iter() {
-                map.insert(chr, ModeType::Type1);
-            }
-        }
-        if let Some(type2) = modegrp_iter.next() {
-            for &chr in type2.iter() {
-                map.insert(chr, ModeType::Type2);
-            }
-        }
-        if let Some(type3) = modegrp_iter.next() {
-            for &chr in type3.iter() {
-                map.insert(chr, ModeType::Type3);
-            }
-        }
-
-        map
-    } else {
-        // sane defaults assuming we don't get an answer.
-        hashmap![
-            b'b' => ModeType::Type1,
-            b'e' => ModeType::Type1,
-            b'i' => ModeType::Type1,
-            b'k' => ModeType::Type2,
-            b'l' => ModeType::Type3,
-        ]
-    }
-}
-
-fn join_part_channels(command: &[u8], channels: &Vec<String>) -> Vec<u8> {
-    let mut ret = vec![];
-    let mut lsize = ret.len();
-    let mut first = true;
-
-    for channel in channels {
-        if channel.len() + lsize >= 510 {
-            lsize = 0usize;
-            first = true;
-            ret.extend(b"\r\n");
-        }
-
-        if !first {
-            ret.push(b',');
-        } else {
-            ret.extend(command);
-            ret.push(b' ');
-            lsize = command.len();
-            first = false;
-        }
-        ret.extend(channel.as_bytes());
-        lsize += channel.len() + 1;
-    }
-    ret.extend(b"\r\n");
-
-    ret
-}
-
 impl Client {
     pub fn new(config: &Config) -> Self {
         let state = State {
             nick: config.general.nick.clone(),
             channels: config.general.channels.clone(),
-            umode: 0,
+            umode: HashSet::new(),
             channel_modes: HashMap::new(),
             ready_state: IrcState::Unknown,
             original_nick: None,
+            casemapping: CaseMapping::Rfc1459,
+            chantypes: vec![b'#', b'&'],
+            mode_prefix: vec![],
         };
         let rng_v = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -203,8 +156,6 @@ impl Client {
             state,
             read_buffer: [0u8; BUF_SIZ],
             read_head: 0,
-            plugin_buffer: [0u8; BUF_SIZ],
-            plugin_head: 0,
             write_buffer: VecDeque::with_capacity(BUF_SIZ),
             rng: SmallRng::seed_from_u64(rng_v),
         };
@@ -214,33 +165,18 @@ impl Client {
         ret
     }
 
-    /// Parse the CAP command from the server
-    /// Messages usually look like -> :server CAP YOUR_NICK ACK :cap1 [cap2...]
-    /// We currently only handle ACK for multi-prefix with a future use of
-    /// sasl to come.
-    fn parse_cap(m: Message) -> bool {
-        let mut piter = m.parameters();
-
-        // We throw away the nickmake parameter
-        if piter.next().is_none() {
-            return false; // we have an error.
-        }
-        if let Some(ack) = piter.next() {
-            if ack == b"ACK" {
-                return false;
-            }
-        } else {
-            // not enough params
-            return false;
-        }
-
-        if let Some(caplist) = piter.next() {
-            caplist
-                .split(|&chr| chr == b' ')
-                .any(|cap| cap == b"multi-prefix")
+    fn is_me(&self, msg: &Message) -> bool {
+        if let Some(my_nick) = msg.nick {
+            // Looks like the server changed my name.
+            case_cmp(&self.state.casemapping, my_nick, self.state.nick.as_bytes())
         } else {
             false
         }
+    }
+
+    // or in modern words "direct message"
+    fn is_private_message(&self, target: &[u8]) -> bool {
+        case_cmp(&self.state.casemapping, target, self.state.nick.as_bytes())
     }
 
     fn handle_data(&mut self, len: usize) -> IrcProto {
@@ -249,7 +185,7 @@ impl Client {
         let mut partial_end = 0usize;
 
         let buf = &self.read_buffer[..len];
-        let iter = BufIterator::new(&buf);
+        let iter = BufIterator::new(buf);
         for line in iter {
             let msg = match line {
                 TruncStatus::Full(data) => Message::new(data),
@@ -276,8 +212,7 @@ impl Client {
                     Some(cmd) if cmd == b"ERROR" => {
                         if let Some(params) = msg.params {
                             let str_v = String::from_utf8_lossy(params);
-                            println!("Recv error: {:?}", str_v);
-                            return IrcProto::Error("We are banned.".to_owned());
+                            return IrcProto::Error(str_v.to_string());
                         }
                         // quit the stream
                         self.write_buffer.extend(b"QUIT :bye\r\n");
@@ -298,8 +233,8 @@ impl Client {
                 Some(nick) if nick == b"NICK" => {
                     if let Some(my_nick) = msg.nick {
                         // Looks like the server changed my name.
-                        if my_nick == nick {
-                            let str_v = String::from_utf8_lossy(nick);
+                        if case_cmp(&self.state.casemapping, my_nick, self.state.nick.as_bytes()) {
+                            let str_v = String::from_utf8_lossy(my_nick);
                             self.state.nick = str_v.to_string();
                             println!(
                                 "INFO: The server changed our nick to: {:?}",
@@ -308,24 +243,71 @@ impl Client {
                         }
                     }
                 }
-                Some(privmsg) if privmsg == b"PRIVMSG" || privmsg == b"NOTICE" => {}
-                Some(join) if join == b"JOIN" => {}
-                Some(part) if part == b"PART" => {}
-                Some(kick) if kick == b"KICK" => {}
+                Some(privmsg) if privmsg == b"PRIVMSG" => {
+                    let mut params = msg.parameters();
+                    match (msg.nick, params.next(), params.next()) {
+                        (Some(nick), Some(target), Some(message)) => {
+                            if self.is_private_message(&target) && message == b"\x01VERSION\x01" {
+                                self.write_buffer.extend(b"NOTICE ");
+                                self.write_buffer.extend(nick);
+                                self.write_buffer.extend(b" :\x01r8ball: v0.0.0\x01\r\n");
+                                ret = IrcProto::Data;
+                            }
+                        }
+                        _ => (),
+                    };
+                }
+                // :me JOIN #chan
+                Some(join) if join == b"JOIN" => {
+                    if self.is_me(&msg) {
+                        if let Some(chan) = msg.parameters().next() {
+                            let ch = String::from_utf8_lossy(chan).to_string();
+                            self.state.channels.push(ch);
+                        }
+                    }
+                }
+                // :me PART #chan
+                Some(part) if part == b"PART" => {
+                    if self.is_me(&msg) {
+                        if let Some(chan) = msg.parameters().next() {
+                            self.state.channels.retain(|x| x.as_bytes() != chan);
+                        }
+                    }
+                }
+                // :the_kicker KICK #chan the_victim :reason
+                Some(kick) if kick == b"KICK" => {
+                    let mut params = msg.parameters();
+                    match (params.next(), params.next()) {
+                        (Some(channel), Some(victim)) => {
+                            if case_cmp(&self.state.casemapping, victim, self.state.nick.as_bytes())
+                            {
+                                self.state.channels.retain(|x| x.as_bytes() != channel);
+                                if let Some(reason) = params.next() {
+                                    let channel = String::from_utf8_lossy(channel);
+                                    let reason_given = String::from_utf8_lossy(reason);
+                                    println!("Kicked from {}. reason: {}", channel, reason_given);
+                                }
+                            }
+                        }
+                        _ => (),
+                    }
+                }
                 Some(invite) if invite == b"INVITE" => {}
                 Some(identified) if identified == b"004" => {
-                    self.state.ready_state = IrcState::Ready(false);
-                    todo!() // send join channel commands
+                    self.state.ready_state = IrcState::Authenticated;
+                    self.write_buffer
+                        .extend(join_channels(&self.state.channels));
+                    self.state.channels.clear(); // remove all channels, we re-add them when we get a JOIN
                 }
                 Some(isupport) if isupport == b"005" => {
                     self.state.ready_state = IrcState::Ready(true);
-                    todo!(); // parse ISUPPORT
+                    // todo!(); // parse ISUPPORT
                 }
                 // reply to NAMES(X) Command or message sent on joining a channel
                 Some(names_repl) if names_repl == b"353" => {
-                    if self.state.ready_state == IrcState::Ready(true) {
-                        todo!()
-                    }
+                    //if self.state.ready_state == IrcState::Ready(true) {
+                    //    todo!()
+                    //}
                 }
                 // nickname collision
                 Some(nick_col) if nick_col == b"433" || nick_col == b"436" => {
@@ -351,7 +333,16 @@ impl Client {
                 Some(banned) if banned == b"465" => {
                     return IrcProto::Error("We are banned.".to_owned());
                 }
-                Some(cap) if cap == b"CAP" => {}
+                Some(cap) if cap == b"CAP" => {
+                    if !parse_cap(&msg) {
+                        return IrcProto::Error(
+                            "We did not receive and ACK for multi-prefix".to_owned(),
+                        );
+                    } else {
+                        self.write_buffer.extend(b"CAP END\r\n");
+                        ret = IrcProto::Data;
+                    }
+                }
                 Some(cap) if cap == b"903" => {
                     todo!() // implement sasl challenge & response
                 }
@@ -366,11 +357,20 @@ impl Client {
                 }
                 Some(pong) if pong == b"PONG" => {
                     println!("DEBUG: PONG recv. TODO");
-                    todo!()
                 }
                 Some(any) => {
-                    let str_v = String::from_utf8_lossy(any);
-                    println!("Got: {:?}", str_v);
+                    let str_n = if let Some(nick) = msg.nick {
+                        String::from_utf8_lossy(nick).to_string()
+                    } else {
+                        "<NO NICK>".to_owned()
+                    };
+                    let str_c = String::from_utf8_lossy(any);
+                    let str_p = if let Some(params) = msg.params {
+                        String::from_utf8_lossy(params).to_string()
+                    } else {
+                        "".to_owned()
+                    };
+                    println!("Unknown command: {} {} {}", str_n, str_c, str_p);
                 }
                 None => unreachable!(),
             }
@@ -408,7 +408,7 @@ impl Client {
         }
     }
 
-    pub fn process_plugin(&mut self, plug: &mut Plugin) -> bool {
+    fn process_plugbuff(&mut self, plug: &mut Plugin) -> bool {
         let mut has_data = false;
         let mut has_trunc = false;
         let mut slice_at = 0usize;
@@ -433,6 +433,28 @@ impl Client {
         }
 
         has_data
+    }
+
+    pub fn process_plugin(&mut self, plug: &mut Plugin) -> io::Result<bool> {
+        let mut has_data = false;
+        loop {
+            match plug.receive()? {
+                PluginReadStat::Okay => (),
+                PluginReadStat::Eof => break,
+                PluginReadStat::Blocked => break,
+                // buffer needs to processed to make progress
+                PluginReadStat::ReadBufferFull => {
+                    // If true, we have writable data
+                    if self.process_plugbuff(plug) {
+                        has_data = true;
+                    }
+                }
+            }
+        }
+        if self.process_plugbuff(plug) {
+            has_data = true;
+        }
+        Ok(has_data)
     }
 
     pub fn write_data<T: Write>(&mut self, writable: &mut T) -> Result<ClientWriteStat, io::Error> {
@@ -477,17 +499,10 @@ impl Client {
 mod test {
     use std::io::{Cursor, Write};
 
-    use rand::{prelude::SmallRng, Rng, SeedableRng};
+    use crate::{config::config_file::Config, irc::parse::Message};
 
-    use crate::{
-        config::config_file::Config,
-        irc::{
-            iter::{BufIterator, TruncStatus},
-            parse::Message,
-        },
-    };
+    use super::{Client, ClientReadStat, ClientWriteStat};
 
-    use super::{join_part_channels, Client, ClientReadStat, ClientWriteStat};
     const DEFAULT_CONF: &str = r##"
 [general]
 nick = "bot"
@@ -648,42 +663,5 @@ USER bot +i * :bot\r
         assert_eq!(m.command.unwrap(), b"NICK");
         assert_eq!(&m.params.unwrap()[..4], b"bot_");
         assert_ne!(m.params.unwrap(), b"bot");
-    }
-
-    #[test]
-    fn mass_channel_join() {
-        let mut prng = SmallRng::seed_from_u64(123456789);
-        let mut channels = Vec::new();
-        while channels.len() < 256 {
-            let mut channel = "#".to_owned();
-            while channel.len() < 30 {
-                channel.push(prng.gen_range('a'..'z'));
-                if prng.gen_bool(1.0 / 15.0) {
-                    break;
-                }
-            }
-            channels.push(channel);
-        }
-
-        let mut channels2: Vec<String> = Vec::new();
-        let res = join_part_channels(b"JOIN", &channels);
-        for line in BufIterator::new(&res) {
-            match line {
-                TruncStatus::Full(msg) => {
-                    assert!(msg.len() <= 512);
-                    let m = Message::new(msg);
-                    let list = m.parameters().next().unwrap();
-                    for chan in list.split(|&chr| chr == b',') {
-                        channels2.push(String::from_utf8_lossy(chan).to_string());
-                    }
-                }
-                TruncStatus::Part(_) => panic!("shouldn't happen."),
-            }
-        }
-
-        assert_eq!(channels.len(), channels2.len());
-        for (lhs, rhs) in channels.iter().zip(channels2.iter()) {
-            assert_eq!(lhs, rhs);
-        }
     }
 }

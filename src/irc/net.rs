@@ -35,7 +35,7 @@ use crate::irc::client::{ClientReadStat, ClientWriteStat};
 use crate::{config::config_file::Config, MainError};
 
 use super::client::Client;
-use super::plugin::{Plugin, PluginReadStat};
+use super::plugin::Plugin;
 
 fn open_conn(conn_str: String) -> Result<TcpStream, io::Error> {
     let mut conn_details = conn_str.to_socket_addrs()?;
@@ -95,7 +95,7 @@ pub fn event_loop(config_path: &Path, config: &mut Config) -> Result<(), MainErr
                                 ClientReadStat::Error(err) => return Err(MainError::IrcProto(err)),
                             }
                         }
-                    } else {
+                    } else if event.is_writable() {
                         loop {
                             match irc_client.write_data(&mut conn)? {
                                 ClientWriteStat::Blocked => break,
@@ -110,6 +110,8 @@ pub fn event_loop(config_path: &Path, config: &mut Config) -> Result<(), MainErr
                                 }
                             }
                         }
+                    } else {
+                        break 'outer;
                     }
                 }
                 SIGNAL_TOKEN => loop {
@@ -127,27 +129,8 @@ pub fn event_loop(config_path: &Path, config: &mut Config) -> Result<(), MainErr
                 _ => {
                     let ev_tok = event.token();
                     if let Some(plug) = plugin_recv.get_mut(&ev_tok) {
-                        loop {
-                            match plug.receive()? {
-                                PluginReadStat::Okay => (),
-                                PluginReadStat::Eof => break,
-                                PluginReadStat::Blocked => break,
-                                // buffer needs to processed to make progress
-                                PluginReadStat::ReadBufferFull => {
-                                    // If true, we have writable data
-                                    if irc_client.process_plugin(plug) {
-                                        poll.registry().reregister(
-                                            &mut conn,
-                                            IRC_CONN,
-                                            Interest::READABLE | Interest::WRITABLE,
-                                        )?;
-                                    }
-                                }
-                            }
-                        }
-
                         // If true, we have writable data
-                        if irc_client.process_plugin(plug) {
+                        if irc_client.process_plugin(plug)? {
                             poll.registry().reregister(
                                 &mut conn,
                                 IRC_CONN,
